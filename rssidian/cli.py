@@ -1,22 +1,29 @@
-import os
-import sys
 import json
-import click
-from datetime import datetime, timedelta
-from typing import Optional
 import logging
-from rich.console import Console
-from rich.table import Table
-from rich.panel import Panel
-from rich.progress import Progress, TextColumn, BarColumn, SpinnerColumn, TimeElapsedColumn, TimeRemainingColumn, TaskProgressColumn
-from rich import box
+import os
+from datetime import datetime
 
-# Only import the lightweight config module at startup
-from .config import Config, init_config
+import click
+from rich import box
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
+from rich.table import Table
+
 from . import __version__
 
 # Import backup functions at the top level since they're lightweight
-from .backup import create_backup, get_backup_list, restore_backup
+from .backup import create_backup, find_backup, get_backup_list, restore_backup
+
+# Only import the lightweight config module at startup
+from .config import Config, init_config
 
 # Defer heavy imports until they're needed in specific commands
 # These will be imported within each command function
@@ -54,8 +61,9 @@ def ensure_db_exists(config, initialize=True):
     
     # For commands that need a fully initialized database
     # Import here to avoid loading at startup
-    from .models import init_db, get_db_session, Base
     from sqlalchemy import create_engine
+
+    from .models import Base, get_db_session, init_db
     
     if not os.path.exists(config.db_path):
         console.print("[yellow]Database does not exist. Creating it now...[/yellow]")
@@ -115,8 +123,8 @@ def opml_import(ctx, opml_file, force):
     
     try:
         # Import modules here to avoid loading at startup
-        from .opml import parse_opml, import_feeds_from_opml
         from .models import Feed
+        from .opml import import_feeds_from_opml, parse_opml
         
         # Parse the OPML file first to get a count of feeds
         feeds_data = parse_opml(opml_file)
@@ -227,16 +235,17 @@ def add_subscription(ctx, feed_url, title, force):
 
     try:
         # Import modules here
-        from .models import Feed
         import feedparser
         import requests
+
+        from .models import Feed
 
         # Check if feed already exists
         existing_feed = db_session.query(Feed).filter_by(url=feed_url).first()
 
         if existing_feed and not force:
             console.print(f"[yellow]Feed already exists:[/yellow] {existing_feed.title}")
-            console.print(f"Use --force to update the existing feed")
+            console.print("Use --force to update the existing feed")
             db_session.close()
             return
 
@@ -579,8 +588,8 @@ def ingest(ctx, lookback, debug):
     
     # Import modules only when needed
     from .core import RSSProcessor
+    from .cost_tracker import format_cost_summary, init_cost_tracker
     from .markdown import write_digest_to_obsidian
-    from .cost_tracker import init_cost_tracker, format_cost_summary
     
     # Initialize cost tracker if enabled
     cost_tracking_enabled = config.cost_tracking_enabled
@@ -659,7 +668,7 @@ def search(ctx, query, relevance, refresh):
     
     # Import processor only when needed
     from .core import RSSProcessor
-    from .cost_tracker import init_cost_tracker, format_cost_summary
+    from .cost_tracker import format_cost_summary, init_cost_tracker
 
     # Initialize cost tracker if enabled
     cost_tracking_enabled = config.cost_tracking_enabled
@@ -679,8 +688,18 @@ def search(ctx, query, relevance, refresh):
         logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
     
     processor = RSSProcessor(config, db_session)
-    
+
     try:
+        # Surface index health before searching so degraded mode is never silent.
+        status = processor.index_status()
+        if not status["available"]:
+            console.print(
+                f"[yellow]Semantic index unavailable: {status['reason']}[/yellow]"
+            )
+            console.print(
+                "[yellow]Using keyword search over stored article content for now.[/yellow]\n"
+            )
+
         # Create a progress bar for the search process
         with Progress(
             SpinnerColumn(),
@@ -703,7 +722,13 @@ def search(ctx, query, relevance, refresh):
             console.print("[yellow]No matching articles found.[/yellow]")
             db_session.close()
             return
-        
+
+        if results and results[0].get("search_mode") == "keyword_fallback":
+            console.print(
+                "[bold yellow]Keyword fallback results "
+                "(semantic index pending rebuild: rssidian backfill-embeddings)[/bold yellow]\n"
+            )
+
         console.print(f"[bold green]Found {len(results)} matching articles:[/bold green]\n")
         
         # Group results by feed
@@ -824,6 +849,7 @@ def mcp(ctx, port, host, stdio):
         # Run as HTTP server
         # Import modules only when needed
         import uvicorn
+
         from .api import create_api
         
         # Create the FastAPI app
@@ -845,12 +871,19 @@ def backup():
 @backup.command("create")
 @click.pass_context
 def backup_create(ctx):
-    """Create a new database backup."""
+    """Create a new backup (database bundle plus matching vector index)."""
     config = ctx.obj["config"]
-    
+
     backup_path = create_backup(config)
     if backup_path:
-        console.print(f"[green]Created backup at {backup_path}[/green]")
+        console.print(f"[green]Created backup bundle at {backup_path}[/green]")
+        if os.path.exists(config.annoy_index_path):
+            console.print("[green]Included: database + Annoy vector index (manifest-bound)[/green]")
+        else:
+            console.print(
+                "[yellow]Included: database only (no vector index found). "
+                "Restore will require an index rebuild before semantic search.[/yellow]"
+            )
     else:
         console.print("[bold red]Failed to create backup.[/bold red]")
 
@@ -874,17 +907,38 @@ def backup_list(ctx):
     
     backup_table = Table(box=box.SIMPLE)
     backup_table.add_column("Date")
+    backup_table.add_column("Type")
+    backup_table.add_column("Index", justify="center")
+    backup_table.add_column("Articles", justify="right")
     backup_table.add_column("Size", justify="right")
-    
+
     for backup in backups:
+        if backup.get("is_bundle"):
+            backup_type = "bundle"
+            index_state = "yes" if backup.get("has_index") else "missing"
+            article_count = (
+                str(backup["article_count"]) if backup.get("article_count") is not None else "-"
+            )
+        else:
+            backup_type = "legacy db"
+            index_state = "[red]none[/red]"
+            article_count = "-"
+
         backup_table.add_row(
             backup['date'],
+            backup_type,
+            index_state,
+            article_count,
             f"{backup['size_mb']:.2f} MB"
         )
-    
+
     console.print(backup_table)
     console.print()
     console.print(f"[dim]Backup location: {config.backup_dir}[/dim]")
+    console.print(
+        "[dim]Bundles bind the database and vector index via a manifest; "
+        "restoring a database-only backup isolates the old index until rebuilt.[/dim]"
+    )
 
 
 @backup.command("restore")
@@ -892,48 +946,69 @@ def backup_list(ctx):
 @click.option("--force/--no-force", default=False, help="Force restore without confirmation")
 @click.pass_context
 def backup_restore(ctx, backup_date, force):
-    """Restore database from a backup."""
+    """Restore database (and matching vector index when bundled)."""
     config = ctx.obj["config"]
-    
+
     backups = get_backup_list(config)
-    
-    # Find the backup by date
-    target_backup = None
-    for backup in backups:
-        if backup_date in backup["date"]:
-            target_backup = backup
-            break
-    
+
+    # Find the backup by date (matches bundle names and legacy *.db filenames)
+    target_backup = find_backup(backups, backup_date)
+
     if not target_backup:
         click.echo(f"No backup found for date: {backup_date}", err=True)
         return
-    
+
     # Get current database info
     db_path = config.db_path
     current_size = os.path.getsize(db_path) / (1024 * 1024) if os.path.exists(db_path) else 0
-    
+
     # Show comparison between current and backup
     info_table = Table(show_header=False, box=box.SIMPLE)
     info_table.add_column("Info", style="cyan")
     info_table.add_column("Value")
-    
+
+    info_table.add_row("Backup type", "bundle (db + index)" if target_backup.get("is_bundle") else "legacy database file")
     info_table.add_row("Current database size", f"{current_size:.2f} MB")
     info_table.add_row("Backup database size", f"{target_backup['size_mb']:.2f} MB")
-    
+    if target_backup.get("is_bundle"):
+        info_table.add_row(
+            "Bundled vector index",
+            "yes — restored together with the database" if target_backup.get("has_index")
+            else "no — installed index will be isolated"
+        )
+        if target_backup.get("article_count") is not None:
+            info_table.add_row("Articles in backup", str(target_backup["article_count"]))
+    else:
+        info_table.add_row(
+            "Vector index",
+            "[red]not included — installed index will be isolated, rebuild required[/red]"
+        )
+
     console.print(info_table)
     console.print()
-    
+
     # Confirm restore
     if not force:
         if not click.confirm("Are you sure you want to restore from this backup? This will overwrite your current database."):
             console.print("[yellow]Restore cancelled.[/yellow]")
             return
-    
+
     # Perform restore
     success = restore_backup(backup_date, config, force=force)
-    
+
     if success:
         console.print(f"[green]Successfully restored database from {target_backup['date']} backup.[/green]")
+        if target_backup.get("has_index"):
+            console.print(
+                "[green]Matching vector index restored as a pair — semantic search "
+                "resolves the same articles as before.[/green]"
+            )
+        else:
+            console.print(
+                "[yellow]The previous vector index was isolated because it was built "
+                "for a different database. Search now uses keyword matching over article "
+                "content; run 'rssidian backfill-embeddings' to rebuild semantic search.[/yellow]"
+            )
     else:
         console.print("[bold red]Failed to restore backup.[/bold red]")
 
@@ -977,21 +1052,30 @@ def show_config(ctx):
                 break
             vector_index_size_bytes /= 1024.0
     
+    # Check index/database consistency without loading the embedding model.
+    from .core import RSSProcessor
+    index_health = RSSProcessor(config, db_session).index_status()
+    if index_health["available"]:
+        index_health_human = "[green]verified — matches database[/green]"
+    else:
+        index_health_human = f"[red]stale/missing — {index_health['mode']}[/red]"
+
     # Configuration info
     console.print(Panel.fit(
-        "[bold blue]RSSidian Configuration[/bold blue]", 
+        "[bold blue]RSSidian Configuration[/bold blue]",
         border_style="blue"
     ))
-    
+
     config_table = Table(show_header=False, box=box.SIMPLE)
     config_table.add_column("Setting", style="cyan")
     config_table.add_column("Value")
-    
+
     config_table.add_row("Config path", config.config_path)
     config_table.add_row("Database path", config.db_path)
     config_table.add_row("Obsidian vault", config.obsidian_vault_path)
     config_table.add_row("Vector index", config.annoy_index_path)
     config_table.add_row("Vector index size", vector_index_size_human)
+    config_table.add_row("Vector index health", index_health_human)
     config_table.add_row(
         "OpenRouter API", 
         "[green]Configured[/green]" if config.openrouter_api_key else "[red]Not configured[/red]"

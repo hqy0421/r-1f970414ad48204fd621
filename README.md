@@ -205,29 +205,58 @@ rssidian mcp --stdio                   # Start in STDIO mode for Claude Desktop 
 
 ## Database Backup
 
-RSSidian includes a robust backup system to help you safeguard your article database:
+RSSidian includes a robust backup system to help you safeguard your article
+database **and** its semantic search index together:
 
-- Automatic Timestamping: Backups are automatically named with YYYY-MM-DD format
-- Multiple Daily Backups: System automatically handles multiple backups on the same day by adding an index
-- Safe Restore Process: Creates temporary backup before restore in case of failures
+- **Manifest-bound bundles**: each backup is a directory containing the SQLite
+  database (`rssidian.db`), the Annoy vector index (`annoy.idx`) and a
+  `manifest.json` that records both files' SHA-256 hashes, sizes and the entry
+  range they cover (article id bounds, embedded-article count and an id-set
+  fingerprint). The two sides are therefore version-locked: restoring a bundle
+  guarantees the same content resolves to the same article through both stores.
+- **Automatic timestamping**: backups are named with the `YYYY-MM-DD` format;
+  multiple backups on the same day get an incrementing `-N` suffix.
+- **Tamper detection**: a restore refuses any bundle whose files no longer match
+  the manifest hashes.
+- **Safe restore process**: temporary copies are kept and rolled back on failure.
 
 Commands:
 
 ```bash
-# Create a new backup
+# Create a new backup bundle (database + matching vector index)
 rssidian backup create
 
-# List all backups with sizes and dates
+# List all backups, showing whether each bundles an index
 rssidian backup list
 
-# Restore from a specific date
+# Restore from a specific date (bundle name or legacy YYYY-MM-DD.db file)
 rssidian backup restore 2025-02-24
+```
+
+### Restoring without a matching index
+
+Legacy single-file backups (and bundles created when no index existed) contain
+the database only. Because the Annoy index keys vectors by article id, loading
+the previously installed index against a restored database would map ids onto
+the wrong articles. Instead of opening that foreign index, RSSidian:
+
+1. **Isolates** it by renaming the file to `annoy.idx.isolated` (nothing is
+   deleted).
+2. Serves search via **keyword matching over the article content stored in the
+   database**, so identical content still finds the same article.
+3. Marks the index as **pending rebuild** in `search` output and `show-config`.
+
+Rebuild the semantic index when convenient — embeddings are persisted in the
+database, so this needs no re-ingestion:
+
+```bash
+rssidian backfill-embeddings
 ```
 
 When restoring a backup, RSSidian will:
 
+- Show the backup type and whether a matching index is bundled
 - Show size difference between current and backup database
-- Display time difference between current and backup
 - Require explicit confirmation before proceeding
 - Create a temporary backup of your current database as a safety measure
 
@@ -240,7 +269,7 @@ rssidian show-config
 ```
 
 This will display:
-- Vector index location and size
+- Vector index location, size and health (verified against the database, or stale/missing with fallback active)
 - Number of total articles
 - Number of articles with embeddings
 - Other configuration settings

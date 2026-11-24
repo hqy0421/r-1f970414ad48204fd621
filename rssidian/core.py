@@ -1,17 +1,24 @@
-import os
 import json
-import time
-from typing import List, Dict, Any, Optional, Tuple, Callable, Union
-from datetime import datetime, timedelta
 import logging
-import requests
-from sqlalchemy.orm import Session
-from tqdm import tqdm
+import os
 import re
 from collections import defaultdict
-from sentence_transformers import SentenceTransformer
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
 from annoy import AnnoyIndex
-from rich.progress import Progress, TextColumn, BarColumn, SpinnerColumn, TimeElapsedColumn, TimeRemainingColumn, TaskProgressColumn
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+from sentence_transformers import SentenceTransformer
+from sqlalchemy.orm import Session
 
 from .config import Config
 from .models import Article, Feed
@@ -40,6 +47,9 @@ class RSSProcessor:
         self.db_session = db_session
         self._embedding_model = None
         self._vector_index = None
+        # Whether the loaded index is verified to cover the current database.
+        # None = not checked yet, True/False = verdict from _load_or_create_index.
+        self._index_verified: Optional[bool] = None
 
     @property
     def embedding_model(self):
@@ -436,27 +446,144 @@ class RSSProcessor:
             new_index.save(self.config.annoy_index_path)
             logger.info(f"Rebuilt vector index with {indexed} embeddings ({len(pending)} new)")
 
-        # Clear state for next batch
-        self._vector_index = None  # Lazy-reload on next search
+        # Clear state for next batch; the freshly saved index will be verified
+        # against the database on next load rather than trusted blindly.
+        self._vector_index = None
+        self._index_verified = None
         self._pending_embeddings = {}
 
         return len(pending)
 
-    def _load_or_create_index(self) -> None:
-        """Load the existing Annoy index or create a new one."""
-        embedding_dim = 768  # all-mpnet-base-v2 dimension
+    def _embedded_article_count(self) -> int:
+        """Count database rows that should have a vector in the index."""
+        return self.db_session.query(Article).filter(
+            Article.embedding_generated == True,
+            Article.embedding_vector.isnot(None)
+        ).count()
 
-        self._vector_index = AnnoyIndex(embedding_dim, self.config.annoy_metric)
+    def _index_matches_database(self, index) -> bool:
+        """
+        Check that a loaded Annoy index covers the current database exactly.
 
-        # Try to load existing index
-        if os.path.exists(self.config.annoy_index_path):
+        The index maps Annoy item ids (article ids) to vectors.  After a
+        database-only restore the installed index was built for a different
+        database, so its item ids would resolve to the wrong articles.  Annoy
+        exposes ``get_n_items()`` as ``max_item_id + 1`` (not the number of
+        added items) and returns zero vectors for never-added ids, so the
+        range check combines three signals:
+
+        - index span (max item id + 1) must cover the database's max id
+        - every embedded article id must resolve to a non-zero vector
+        - the index must not contain real vectors for ids the database
+          does not know as embedded articles
+        """
+        rows = self.db_session.query(Article.id, Article.embedding_vector).filter(
+            Article.embedding_generated == True,
+            Article.embedding_vector.isnot(None)
+        ).all()
+        embedded_ids = {row[0] for row in rows}
+
+        if not embedded_ids:
+            # An index file with no matching rows is by definition foreign.
+            logger.warning("Database has no embedded articles but an index file exists")
+            return False
+
+        max_embedded_id = max(embedded_ids)
+        index_span = index.get_n_items()  # Annoy: max item id + 1
+        if index_span < max_embedded_id + 1:
+            logger.warning(
+                f"Vector index span {index_span} does not cover max embedded "
+                f"article id {max_embedded_id}; index is stale"
+            )
+            return False
+
+        # Every embedded article must have a real (non-zero) vector.
+        for article_id in embedded_ids:
             try:
-                self._vector_index.load(self.config.annoy_index_path)
-                logger.info(f"Loaded existing vector index from {self.config.annoy_index_path}")
+                vector = index.get_item_vector(article_id)
             except Exception as e:
-                logger.error(f"Failed to load vector index: {str(e)}")
-                # Create a new index
-                self._vector_index = AnnoyIndex(embedding_dim, self.config.annoy_metric)
+                logger.warning(
+                    f"Vector index cannot resolve article id {article_id}: {e}; index is stale"
+                )
+                return False
+            if not any(vector):
+                logger.warning(
+                    f"Vector index has no vector for embedded article id {article_id}; "
+                    "index is stale"
+                )
+                return False
+
+        # Every real vector in the index must belong to an embedded article.
+        # Probe ids in the index's span; foreign slots return zero vectors.
+        for candidate_id in range(index_span):
+            if candidate_id in embedded_ids:
+                continue
+            try:
+                vector = index.get_item_vector(candidate_id)
+            except Exception:
+                continue
+            if any(vector):
+                logger.warning(
+                    f"Vector index contains a vector for id {candidate_id} which is "
+                    "not an embedded article in the database; index is foreign"
+                )
+                return False
+
+        return True
+
+    def _load_or_create_index(self) -> None:
+        """
+        Load the existing Annoy index after verifying it matches the database.
+
+        An index built for a different database (e.g. left behind after a
+        database-only backup restore) is never loaded: doing so would map
+        article ids to the wrong content.  In that case the index is moved
+        aside and semantic search stays disabled until the index is rebuilt.
+        """
+        embedding_dim = 768  # all-mpnet-base-v2 dimension
+        index_path = self.config.annoy_index_path
+
+        if not os.path.exists(index_path):
+            logger.warning(
+                "No vector index file present; semantic search is unavailable until "
+                "the index is rebuilt (rssidian backfill-embeddings)."
+            )
+            self._vector_index = None
+            self._index_verified = False
+            return
+
+        index = AnnoyIndex(embedding_dim, self.config.annoy_metric)
+        try:
+            index.load(index_path)
+        except Exception as e:
+            logger.error(f"Failed to load vector index: {str(e)}")
+            self._vector_index = None
+            self._index_verified = False
+            return
+
+        if not self._index_matches_database(index):
+            logger.error(
+                "Installed vector index does not match the current database "
+                "(entry range mismatch). Refusing to load it; semantic search will "
+                "degrade to content matching until the index is rebuilt."
+            )
+            try:
+                index.unload()
+            except Exception:
+                pass
+            # Local import: backup.py is lightweight and keeps core startup lazy.
+            from .backup import isolate_foreign_index
+            isolate_foreign_index(
+                self.config,
+                reason="index/database entry range mismatch detected at load time",
+            )
+            self._vector_index = None
+            self._index_verified = False
+            return
+
+        logger.info(f"Loaded and verified vector index from {index_path}")
+        self._vector_index = index
+        self._index_verified = True
 
     def find_similar_articles(self, article: Article, similarity_threshold: float = None) -> List[Article]:
         """
@@ -503,7 +630,11 @@ class RSSProcessor:
         if self._vector_index is None:
             self._load_or_create_index()
 
-        if self._vector_index is None:
+        if not self._index_verified or self._vector_index is None:
+            logger.warning(
+                "Skipping embedding-based similarity: vector index is unavailable "
+                "or does not match the database; title-based similarity still applies."
+            )
             return []
 
         try:
@@ -720,7 +851,7 @@ Provide a comprehensive summary that synthesizes information from all sources.""
         ) as progress:
             # Step 1: Generate embeddings for all articles first (needed for similarity detection)
             logger.info(f"Generating embeddings for {len(unprocessed)} articles...")
-            embedding_task = progress.add_task(f"[bold]Generating embeddings", total=len(unprocessed))
+            embedding_task = progress.add_task("[bold]Generating embeddings", total=len(unprocessed))
             
             for article in unprocessed:
                 try:
@@ -925,9 +1056,22 @@ Provide a comprehensive summary that synthesizes information from all sources.""
         # Commit changes
         self.db_session.commit()
 
-    def search(self, query: str, relevance_threshold: float = 0.3, max_results: int = 20, refresh: bool = False) -> List[Dict[str, Any]]:
+    def search(
+        self,
+        query: str,
+        relevance_threshold: float = 0.3,
+        max_results: int = 20,
+        refresh: bool = False,
+    ) -> List[Dict[str, Any]]:
         """
         Search for articles using semantic search.
+
+        If the vector index is missing or does not match the current database
+        (for example after a database-only restore), semantic search degrades
+        to keyword matching over the article text stored in the database.
+        Callers can detect this mode via :meth:`index_status`; degraded
+        results are still returned rather than failing, but the index must be
+        rebuilt to restore semantic ranking.
 
         Args:
             query: Search query
@@ -938,14 +1082,17 @@ Provide a comprehensive summary that synthesizes information from all sources.""
         Returns:
             List of search results
         """
-        # Refresh the index if requested
+        # Refresh the index if requested or never loaded
         if refresh or self._vector_index is None:
             self._load_or_create_index()
 
-            # If still none, there are no embeddings yet
-            if self._vector_index is None:
-                logger.warning("No vector index available")
-                return []
+        if not self._index_verified or self._vector_index is None:
+            logger.warning(
+                "Semantic index unavailable; serving keyword search over stored "
+                "article content instead. Rebuild the index with "
+                "'rssidian backfill-embeddings' to restore semantic search."
+            )
+            return self._keyword_search(query, max_results)
 
         # Generate query embedding
         query_embedding = self._generate_embedding(query)
@@ -990,6 +1137,106 @@ Provide a comprehensive summary that synthesizes information from all sources.""
 
         # Limit to max_results
         return results[:max_results]
+
+    def index_status(self) -> Dict[str, Any]:
+        """
+        Report whether the semantic index is usable for the current database.
+
+        Returns:
+            Dictionary with ``available`` (bool), ``mode`` ("semantic" or
+            "keyword_fallback") and a human-readable ``reason``.
+        """
+        if self._index_verified is None:
+            self._load_or_create_index()
+
+        if self._index_verified and self._vector_index is not None:
+            return {
+                "available": True,
+                "mode": "semantic",
+                "reason": "vector index matches the current database",
+            }
+
+        index_path = self.config.annoy_index_path
+        if not os.path.exists(index_path):
+            reason = (
+                "no vector index file present; semantic search is pending rebuild "
+                "(rssidian backfill-embeddings)"
+            )
+        else:
+            reason = (
+                "vector index does not match the current database and was isolated; "
+                "semantic search is pending rebuild (rssidian backfill-embeddings)"
+            )
+        return {"available": False, "mode": "keyword_fallback", "reason": reason}
+
+    def _keyword_search(self, query: str, max_results: int = 20) -> List[Dict[str, Any]]:
+        """
+        Fallback search over article text when no valid vector index exists.
+
+        Scores articles by normalized term overlap against title, summary and
+        content, so identical content still resolves to the same article even
+        while the semantic index is unavailable.  No embedding model is
+        loaded, keeping the degraded path cheap.
+
+        Args:
+            query: Search query
+            max_results: Maximum number of results to return
+
+        Returns:
+            Search result dictionaries in the same shape as semantic search,
+            with ``relevance`` holding the normalized keyword score (0-1)
+        """
+        query_terms = set(re.findall(r"\w+", query.lower()))
+        if not query_terms:
+            return []
+
+        # Only articles with searchable text are candidates.
+        articles = self.db_session.query(Article).filter(
+            (Article.content.isnot(None)) | (Article.summary.isnot(None))
+            | (Article.title.isnot(None))
+        ).all()
+
+        scored: List[Tuple[float, Article]] = []
+        for article in articles:
+            title_terms = set(re.findall(r"\w+", (article.title or "").lower()))
+            summary_terms = set(re.findall(r"\w+", (article.summary or "").lower()))
+            # Content can be large; score on the same term-set representation.
+            content_terms = set(re.findall(r"\w+", (article.content or "").lower()))
+
+            title_hits = len(query_terms & title_terms)
+            summary_hits = len(query_terms & summary_terms)
+            content_hits = len(query_terms & content_terms)
+            total_hits = title_hits + summary_hits + content_hits
+            if total_hits == 0:
+                continue
+
+            # Weight title matches highest, then summary, then body.
+            raw_score = title_hits * 3 + summary_hits * 2 + content_hits
+            # Normalize against the maximum achievable score for this query.
+            max_score = len(query_terms) * 6
+            score = min(raw_score / max_score, 1.0) if max_score else 0.0
+            scored.append((score, article))
+
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+
+        results = []
+        for score, article in scored[:max_results]:
+            feed = self.db_session.query(Feed).filter_by(id=article.feed_id).first()
+            excerpt = self._generate_excerpt(article.content, query, self.config.excerpt_length)
+            results.append({
+                "id": article.id,
+                "title": article.title,
+                "feed": feed.title if feed else "Unknown Feed",
+                "url": article.url,
+                "published_at": article.published_at,
+                "summary": article.summary,
+                "excerpt": excerpt,
+                "quality_tier": article.quality_tier,
+                "quality_score": article.quality_score,
+                "relevance": score,
+                "search_mode": "keyword_fallback",
+            })
+        return results
 
     def _generate_excerpt(self, text: str, query: str, max_length: int = 300) -> str:
         """
@@ -1238,7 +1485,7 @@ Provide a comprehensive summary that synthesizes information from all sources.""
         ).all()
 
         if not articles:
-            logger.warning(f"No processed articles found in date range")
+            logger.warning("No processed articles found in date range")
             from_date_str = start_date.strftime('%Y-%m-%d')
             to_date_str = end_date.strftime('%Y-%m-%d')
             return {
